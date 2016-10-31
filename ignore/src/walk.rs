@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::fs::{FileType, Metadata};
+use std::fs::{self, FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::vec;
@@ -290,10 +290,7 @@ impl Iterator for Walk {
                     match self.its.next() {
                         None => return None,
                         Some((_, None)) => {
-                            return Some(Ok(DirEntry {
-                                dent: None,
-                                err: None,
-                            }));
+                            return Some(Ok(DirEntry::new_stdin()));
                         }
                         Some((path, Some(it))) => {
                             self.it = Some(it);
@@ -338,7 +335,7 @@ impl Iterator for Walk {
                     }
                     let (igtmp, err) = self.ig.add_child(ent.path());
                     self.ig = igtmp;
-                    return Some(Ok(DirEntry { dent: Some(ent), err: err }));
+                    return Some(Ok(DirEntry::new_walkdir(ent, err)));
                 }
                 Ok(WalkEvent::File(ent)) => {
                     if self.skip_entry(&ent) {
@@ -349,7 +346,7 @@ impl Iterator for Walk {
                     if !ent.file_type().is_file() {
                         continue;
                     }
-                    return Some(Ok(DirEntry { dent: Some(ent), err: None }));
+                    return Some(Ok(DirEntry::new_walkdir(ent, None)));
                 }
             }
         }
@@ -362,50 +359,38 @@ impl Iterator for Walk {
 /// particular directory.
 #[derive(Debug)]
 pub struct DirEntry {
-    dent: Option<walkdir::DirEntry>,
+    dent: DirEntryInner,
     err: Option<Error>,
 }
 
 impl DirEntry {
     /// The full path that this entry represents.
     pub fn path(&self) -> &Path {
-        self.dent.as_ref().map_or(Path::new("<stdin>"), |x| x.path())
+        self.dent.path()
     }
 
     /// Whether this entry corresponds to a symbolic link or not.
     pub fn path_is_symbolic_link(&self) -> bool {
-        self.dent.as_ref().map_or(false, |x| x.path_is_symbolic_link())
+        self.dent.path_is_symbolic_link()
     }
 
     /// Returns true if and only if this entry corresponds to stdin.
     ///
     /// i.e., The entry has depth 0 and its file name is `-`.
     pub fn is_stdin(&self) -> bool {
-        self.dent.is_none()
+        self.dent.is_stdin()
     }
 
     /// Return the metadata for the file that this entry points to.
     pub fn metadata(&self) -> Result<Metadata, Error> {
-        if let Some(dent) = self.dent.as_ref() {
-            dent.metadata().map_err(|err| Error::WithPath {
-                path: self.path().to_path_buf(),
-                err: Box::new(Error::Io(io::Error::from(err))),
-            })
-        } else {
-            let ioerr = io::Error::new(
-                io::ErrorKind::Other, "stdin has no metadata");
-            Err(Error::WithPath {
-                path: Path::new("<stdin>").to_path_buf(),
-                err: Box::new(Error::Io(ioerr)),
-            })
-        }
+        self.dent.metadata()
     }
 
     /// Return the file type for the file that this entry points to.
     ///
     /// This entry doesn't have a file type if it corresponds to stdin.
     pub fn file_type(&self) -> Option<FileType> {
-        self.dent.as_ref().map(|x| x.file_type())
+        self.dent.file_type()
     }
 
     /// Return the file name of this entry.
@@ -413,12 +398,12 @@ impl DirEntry {
     /// If this entry has no file name (e.g., `/`), then the full path is
     /// returned.
     pub fn file_name(&self) -> &OsStr {
-        self.dent.as_ref().map_or(OsStr::new("<stdin>"), |x| x.file_name())
+        self.dent.file_name()
     }
 
     /// Returns the depth at which this entry was created relative to the root.
     pub fn depth(&self) -> usize {
-        self.dent.as_ref().map_or(0, |x| x.depth())
+        self.dent.depth()
     }
 
     /// Returns an error, if one exists, associated with processing this entry.
@@ -427,6 +412,200 @@ impl DirEntry {
     /// file.
     pub fn error(&self) -> Option<&Error> {
         self.err.as_ref()
+    }
+
+    fn new_stdin() -> DirEntry {
+        DirEntry {
+            dent: DirEntryInner::Stdin,
+            err: None,
+        }
+    }
+
+    fn new_walkdir(dent: walkdir::DirEntry, err: Option<Error>) -> DirEntry {
+        DirEntry {
+            dent: DirEntryInner::Walkdir(dent),
+            err: err,
+        }
+    }
+
+    fn new_raw(dent: DirEntryRaw, err: Option<Error>) -> DirEntry {
+        DirEntry {
+            dent: DirEntryInner::Raw(dent),
+            err: err,
+        }
+    }
+}
+
+/// DirEntryInner is the implementation of DirEntry.
+///
+/// It specifically represents three distinct sources of directory entries:
+///
+/// 1. From the walkdir crate.
+/// 2. Special entries that represent things like stdin.
+/// 3. From a path.
+///
+/// Specifically, (3) has to essentially re-create the DirEntry implementation
+/// from WalkDir.
+#[derive(Debug)]
+enum DirEntryInner {
+    Stdin,
+    Walkdir(walkdir::DirEntry),
+    Raw(DirEntryRaw),
+}
+
+impl DirEntryInner {
+    fn path(&self) -> &Path {
+        use self::DirEntryInner::*;
+        match *self {
+            Stdin => Path::new("<stdin>"),
+            Walkdir(ref x) => x.path(),
+            Raw(ref x) => x.path(),
+        }
+    }
+
+    fn path_is_symbolic_link(&self) -> bool {
+        use self::DirEntryInner::*;
+        match *self {
+            Stdin => false,
+            Walkdir(ref x) => x.path_is_symbolic_link(),
+            Raw(ref x) => x.path_is_symbolic_link(),
+        }
+    }
+
+    fn is_stdin(&self) -> bool {
+        match *self {
+            DirEntryInner::Stdin => true,
+            _ => false,
+        }
+    }
+
+    fn metadata(&self) -> Result<Metadata, Error> {
+        use self::DirEntryInner::*;
+        match *self {
+            Stdin => {
+                let err = Error::Io(io::Error::new(
+                    io::ErrorKind::Other, "<stdin> has no metadata"));
+                Err(err.with_path("<stdin>"))
+            }
+            Walkdir(ref x) => {
+                x.metadata().map_err(|err| {
+                    Error::Io(io::Error::from(err)).with_path(x.path())
+                })
+            }
+            Raw(ref x) => x.metadata(),
+        }
+    }
+
+    fn file_type(&self) -> Option<FileType> {
+        use self::DirEntryInner::*;
+        match *self {
+            Stdin => None,
+            Walkdir(ref x) => Some(x.file_type()),
+            Raw(ref x) => Some(x.file_type()),
+        }
+    }
+
+    fn file_name(&self) -> &OsStr {
+        use self::DirEntryInner::*;
+        match *self {
+            Stdin => OsStr::new("<stdin>"),
+            Walkdir(ref x) => x.file_name(),
+            Raw(ref x) => x.file_name(),
+        }
+    }
+
+    fn depth(&self) -> usize {
+        use self::DirEntryInner::*;
+        match *self {
+            Stdin => 0,
+            Walkdir(ref x) => x.depth(),
+            Raw(ref x) => x.depth(),
+        }
+    }
+}
+
+/// DirEntryRaw is essentially copied from the walkdir crate so that we can
+/// build `DirEntry`s from whole cloth in the parallel iterator.
+#[derive(Debug)]
+struct DirEntryRaw {
+    /// The path as reported by the `fs::ReadDir` iterator (even if it's a
+    /// symbolic link).
+    path: PathBuf,
+    /// The file type. Necessary for recursive iteration, so store it.
+    ty: FileType,
+    /// Is set when this entry was created from a symbolic link and the user
+    /// expects the iterator to follow symbolic links.
+    follow_link: bool,
+    /// The depth at which this entry was generated relative to the root.
+    depth: usize,
+}
+
+impl DirEntryRaw {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn path_is_symbolic_link(&self) -> bool {
+        self.ty.is_symlink() || self.follow_link
+    }
+
+    fn metadata(&self) -> Result<Metadata, Error> {
+        if self.follow_link {
+            fs::metadata(&self.path)
+        } else {
+            fs::symlink_metadata(&self.path)
+        }.map_err(|err| Error::Io(io::Error::from(err)).with_path(&self.path))
+    }
+
+    fn file_type(&self) -> FileType {
+        self.ty
+    }
+
+    fn file_name(&self) -> &OsStr {
+        self.path.file_name().unwrap_or_else(|| self.path.as_os_str())
+    }
+
+    fn depth(&self) -> usize {
+        self.depth
+    }
+
+    fn from_entry(
+        depth: usize,
+        ent: &fs::DirEntry,
+    ) -> Result<DirEntryRaw, Error> {
+        let ty = try!(ent.file_type().map_err(|err| {
+            Error::Io(io::Error::from(err)).with_path(ent.path())
+        }));
+        Ok(DirEntryRaw {
+            path: ent.path(),
+            ty: ty,
+            follow_link: false,
+            depth: depth,
+        })
+    }
+
+    fn from_link(depth: usize, pb: PathBuf) -> Result<DirEntryRaw, Error> {
+        let md = try!(fs::metadata(&pb).map_err(|err| {
+            Error::Io(err).with_path(&pb)
+        }));
+        Ok(DirEntryRaw {
+            path: pb,
+            ty: md.file_type(),
+            follow_link: true,
+            depth: depth,
+        })
+    }
+
+    fn from_path(depth: usize, pb: PathBuf) -> Result<DirEntryRaw, Error> {
+        let md = try!(fs::symlink_metadata(&pb).map_err(|err| {
+            Error::Io(err).with_path(&pb)
+        }));
+        Ok(DirEntryRaw {
+            path: pb,
+            ty: md.file_type(),
+            follow_link: false,
+            depth: depth,
+        })
     }
 }
 
