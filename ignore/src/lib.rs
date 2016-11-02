@@ -44,6 +44,7 @@ for result in WalkBuilder::new("./").hidden(false).build() {
 See the documentation for `WalkBuilder` for many other options.
 */
 
+extern crate crossbeam;
 extern crate globset;
 #[macro_use]
 extern crate lazy_static;
@@ -80,6 +81,12 @@ pub enum Error {
     WithLineNumber { line: u64, err: Box<Error> },
     /// An error associated with a particular file path.
     WithPath { path: PathBuf, err: Box<Error> },
+    /// An error associated with a particular directory depth when recursively
+    /// walking a directory.
+    WithDepth { depth: usize, err: Box<Error> },
+    /// An error that occurs when a file loop is detected when traversing
+    /// symbolic links.
+    Loop { ancestor: PathBuf, child: PathBuf },
     /// An error that occurs when doing I/O, such as reading an ignore file.
     Io(io::Error),
     /// An error that occurs when trying to parse a glob.
@@ -101,6 +108,7 @@ impl Error {
             Error::Partial(_) => true,
             Error::WithLineNumber { ref err, .. } => err.is_partial(),
             Error::WithPath { ref err, .. } => err.is_partial(),
+            Error::WithDepth { ref err, .. } => err.is_partial(),
             _ => false,
         }
     }
@@ -111,10 +119,22 @@ impl Error {
             Error::Partial(ref errs) => errs.len() == 1 && errs[0].is_io(),
             Error::WithLineNumber { ref err, .. } => err.is_io(),
             Error::WithPath { ref err, .. } => err.is_io(),
+            Error::WithDepth { ref err, .. } => err.is_io(),
+            Error::Loop { .. } => false,
             Error::Io(_) => true,
             Error::Glob(_) => false,
             Error::UnrecognizedFileType(_) => false,
             Error::InvalidDefinition => false,
+        }
+    }
+
+    /// Returns a depth associated with recursively walking a directory (if
+    /// this error was generated from a recursive directory iterator).
+    pub fn depth(&self) -> Option<usize> {
+        match *self {
+            Error::WithPath { ref err, .. } => err.depth(),
+            Error::WithDepth { depth, .. } => Some(depth),
+            _ => None,
         }
     }
 
@@ -146,6 +166,8 @@ impl error::Error for Error {
             Error::Partial(_) => "partial error",
             Error::WithLineNumber { ref err, .. } => err.description(),
             Error::WithPath { ref err, .. } => err.description(),
+            Error::WithDepth { ref err, .. } => err.description(),
+            Error::Loop { .. } => "file system loop found",
             Error::Io(ref err) => err.description(),
             Error::Glob(ref msg) => msg,
             Error::UnrecognizedFileType(_) => "unrecognized file type",
@@ -168,6 +190,12 @@ impl fmt::Display for Error {
             Error::WithPath { ref path, ref err } => {
                 write!(f, "{}: {}", path.display(), err)
             }
+            Error::WithDepth { ref err, .. } => err.fmt(f),
+            Error::Loop { ref ancestor, ref child } => {
+                write!(f, "File system loop found: \
+                           {} points to an ancestor {}",
+                          child.display(), ancestor.display())
+            }
             Error::Io(ref err) => err.fmt(f),
             Error::Glob(ref msg) => write!(f, "{}", msg),
             Error::UnrecognizedFileType(ref ty) => {
@@ -184,6 +212,30 @@ impl fmt::Display for Error {
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Error {
         Error::Io(err)
+    }
+}
+
+impl From<walkdir::Error> for Error {
+    fn from(err: walkdir::Error) -> Error {
+        let depth = err.depth();
+        if let (Some(anc), Some(child)) = (err.loop_ancestor(), err.path()) {
+            return Error::WithDepth {
+                depth: depth,
+                err: Box::new(Error::Loop {
+                    ancestor: anc.to_path_buf(),
+                    child: child.to_path_buf(),
+                }),
+            };
+        }
+        let path = err.path().map(|p| p.to_path_buf());
+        let mut ig_err = Error::Io(io::Error::from(err));
+        if let Some(path) = path {
+            ig_err = Error::WithPath {
+                path: path,
+                err: Box::new(ig_err),
+            };
+        }
+        ig_err
     }
 }
 
