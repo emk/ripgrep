@@ -146,6 +146,14 @@ impl Error {
         }
     }
 
+    /// Turn an error into a tagged error with the given depth.
+    fn with_depth(self, depth: usize) -> Error {
+        Error::WithDepth {
+            depth: depth,
+            err: Box::new(self),
+        }
+    }
+
     /// Turn an error into a tagged error with the given file path and line
     /// number. If path is empty, then it is omitted from the error.
     fn tagged<P: AsRef<Path>>(self, path: P, lineno: u64) -> Error {

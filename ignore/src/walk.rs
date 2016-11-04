@@ -3,6 +3,7 @@ use std::fs::{self, FileType, Metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::vec;
 
@@ -558,17 +559,9 @@ impl Walk {
 
     fn skip_entry(&self, ent: &walkdir::DirEntry) -> bool {
         if ent.depth() == 0 {
-            // Never skip the root directory.
             return false;
         }
-        let m = self.ig.matched(ent.path(), ent.file_type().is_dir());
-        if m.is_ignore() {
-            debug!("ignoring {}: {:?}", ent.path().display(), m);
-            return true;
-        } else if m.is_whitelist() {
-            debug!("whitelisting {}: {:?}", ent.path().display(), m);
-        }
-        false
+        skip_path(&self.ig, ent.path(), ent.file_type().is_dir())
     }
 }
 
@@ -720,16 +713,47 @@ impl WalkParallel {
     ) where F: Fn(Result<DirEntry, Error>) + Send + Sync + 'static {
         let f = Arc::new(f);
         let queue = Arc::new(MsQueue::new());
+        let num_waiting = Arc::new(AtomicUsize::new(0));
+        let num_quitting = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
         for _ in 0..self.threads() {
             let worker = Worker {
                 f: f.clone(),
                 ig_root: self.ig_root.clone(),
                 queue: queue.clone(),
+                is_waiting: false,
+                is_quitting: false,
+                num_waiting: num_waiting.clone(),
+                num_quitting: num_quitting.clone(),
+                threads: self.threads(),
+                parents: self.parents,
                 max_depth: self.max_depth,
                 follow_links: self.follow_links,
             };
             handles.push(thread::spawn(|| worker.run()));
+        }
+        for path in self.paths {
+            if path == Path::new("-") {
+                f(Ok(DirEntry::new_stdin()));
+                continue;
+            }
+            let result = DirEntryRaw::from_path(0, path)
+                .map(|raw| DirEntry::new_raw(raw, None));
+            let dent = match result {
+                Ok(dent) => dent,
+                Err(err) => {
+                    f(Err(err));
+                    continue;
+                }
+            };
+            if !dent.file_type().map_or(false, |t| t.is_dir()) {
+                f(Ok(dent));
+            } else {
+                queue.push(Message::Work(Work {
+                    dent: dent,
+                    ignore: self.ig_root.clone(),
+                }));
+            }
         }
         for handle in handles {
             handle.join().unwrap();
@@ -751,8 +775,7 @@ enum Message {
 }
 
 struct Work {
-    path: PathBuf,
-    depth: usize,
+    dent: DirEntry,
     ignore: Ignore,
 }
 
@@ -760,12 +783,167 @@ struct Worker {
     f: Arc<Fn(Result<DirEntry, Error>) + Send + Sync + 'static>,
     ig_root: Ignore,
     queue: Arc<MsQueue<Message>>,
+    is_waiting: bool,
+    is_quitting: bool,
+    num_waiting: Arc<AtomicUsize>,
+    num_quitting: Arc<AtomicUsize>,
+    threads: usize,
+    parents: bool,
     max_depth: Option<usize>,
     follow_links: bool,
 }
 
 impl Worker {
-    fn run(self) {
+    fn run(mut self) {
+        while let Some(mut work) = self.get_work() {
+            let depth = work.dent.depth();
+            if self.parents && depth == 0 {
+                let (ig, err) = self.ig_root.add_parents(work.dent.path());
+                work.ignore = ig;
+                if let Some(err) = err {
+                    (self.f)(Err(err));
+                }
+            }
+            let readdir = match fs::read_dir(work.dent.path()) {
+                Ok(readdir) => readdir,
+                Err(err) => {
+                    let err = Error::from(err)
+                        .with_path(work.dent.path()).with_depth(depth);
+                    (self.f)(Err(err));
+                    continue;
+                }
+            };
+            let (ig, err) = work.ignore.add_child(work.dent.path());
+            work.ignore = ig;
+            work.dent.err = err;
+            (self.f)(Ok(work.dent));
+            for result in readdir {
+                let fs_dent = match result {
+                    Ok(fs_dent) => fs_dent,
+                    Err(err) => {
+                        let err = Error::from(err).with_depth(depth + 1);
+                        (self.f)(Err(err));
+                        continue;
+                    }
+                };
+                let result = DirEntryRaw::from_entry(depth + 1, &fs_dent)
+                    .map(|raw| DirEntry::new_raw(raw, None));
+                let dent = match result {
+                    Ok(dent) => dent,
+                    Err(err) => {
+                        (self.f)(Err(err));
+                        continue;
+                    }
+                };
+                let is_dir = dent.file_type().map_or(false, |t| t.is_dir());
+                let is_file = dent.file_type().map_or(false, |t| t.is_file());
+                if skip_path(&work.ignore, dent.path(), is_dir) {
+                    continue;
+                }
+                if !is_dir {
+                    if is_file {
+                        (self.f)(Ok(dent));
+                    }
+                } else {
+                    self.queue.push(Message::Work(Work {
+                        dent: dent,
+                        ignore: work.ignore.clone(),
+                    }));
+                }
+            }
+        }
+    }
+
+    fn get_work(&mut self) -> Option<Work> {
+        loop {
+            match self.queue.try_pop() {
+                Some(Message::Work(work)) => {
+                    self.waiting(false);
+                    self.quitting(false);
+                    return Some(work);
+                }
+                Some(Message::Quit) => {
+                    self.waiting(true);
+                    self.quitting(true);
+                    loop {
+                        let nwait = self.num_waiting();
+                        let nquit = self.num_quitting();
+                        // If the number of waiting workers dropped, then
+                        // abort our attempt to quit.
+                        if nwait < self.threads {
+                            break;
+                        }
+                        // If all workers are in this quit loop, then we
+                        // can stop.
+                        if nquit == self.threads {
+                            return None;
+                        }
+                        // Otherwise, spin.
+                    }
+                    // If we're here, then we've aborted our quit attempt.
+                    continue;
+                }
+                None => {
+                    self.waiting(true);
+                    self.quitting(false);
+                    if self.num_waiting() == self.threads {
+                        for _ in 0..self.threads {
+                            self.queue.push(Message::Quit);
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn num_waiting(&self) -> usize {
+        self.num_waiting.load(Ordering::SeqCst)
+    }
+
+    fn num_quitting(&self) -> usize {
+        self.num_quitting.load(Ordering::SeqCst)
+    }
+
+    fn quitting(&mut self, yes: bool) {
+        if yes {
+            if !self.is_quitting {
+                self.is_quitting = true;
+                self.num_quitting.fetch_add(1, Ordering::SeqCst);
+            }
+        } else {
+            if self.is_quitting {
+                self.is_quitting = false;
+                self.num_quitting.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn waiting(&mut self, yes: bool) {
+        if yes {
+            if !self.is_waiting {
+                self.is_waiting = true;
+                self.num_waiting.fetch_add(1, Ordering::SeqCst);
+            }
+        } else {
+            if self.is_waiting {
+                self.is_waiting = false;
+                self.num_waiting.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+fn skip_path(ig: &Ignore, path: &Path, is_dir: bool) -> bool {
+    let m = ig.matched(path, is_dir);
+    if m.is_ignore() {
+        debug!("ignoring {}: {:?}", path.display(), m);
+        true
+    } else if m.is_whitelist() {
+        debug!("whitelisting {}: {:?}", path.display(), m);
+        false
+    } else {
+        false
     }
 }
 
